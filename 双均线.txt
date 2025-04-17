@@ -1,0 +1,193 @@
+import numpy as np
+import talib
+import pandas as pd
+from ComstarApi import *
+
+def init(context):
+    '''
+    策略做多做空逻辑：
+    1、分钟线短均线上穿长均线+最新成交价上涨 ，用当前最优“买”价做多；
+    2、分钟线短均线下穿长均线+最新成交家下跌 ，用当前最优“卖”价做空；
+
+    策略仓位控制逻辑：
+    1、开仓后，若有同方向信号，不再追加买入；出现反方向信号，执行平仓。
+
+    行情设置格式（行情码和BAR级别仅供参考，可根据需要进行修改）
+    行情码              类型         频率     下单平台       是否撮合    数据清洗    全域变量
+    230026.CFXO        逐笔成交      0        X-BondT+1      是         原始        cs1
+    230026.CFXO        K-bar        1min      X-BondT+1      否         原始        cs2
+    230026-CFXO        报价行情      无      X-BondT+1      否         原始        cs3
+    
+    本策略默认参数如下：
+    context.open_flag = 1
+    context.volume = 10000000
+    context.count_order = 100
+    context.count_trade = 80
+    '''
+
+    
+    # 策略全局参数
+    context.open_flag = add_parameter(int, 'open_flag', '是否发单')  # 1，发单；0，不发单
+    context.per_volume = add_parameter(int, 'per_volume', '单笔发单量')  # 发单量及最大持仓量
+    context.max_order = add_parameter(int, 'max_order', '最大发单次数')  # 最大发单次数
+    context.max_trade = add_parameter(int, 'max_trade', '最大成交次数')  # 最大成交次数
+    context.stop_loss = add_parameter(float, 'stop_loss', '止损比例')  #按照券面
+    context.take_profit= add_parameter(float, 'take_profit', '止盈比例') #按照券面
+
+    
+    #策略逻辑参数
+    context.fast_period = add_parameter(int, 'fast_period', '短期均线周期')
+    context.slow_period = add_parameter(int, 'slow_period', '长期均线周期')
+
+    # 添加监控因子
+    context.Fast = add_factor(float, 'Fast', '短期均线')
+    context.Slow = add_factor(float, 'Slow', '长期均线')
+    context.price_last = add_factor(float, 'price_last', '最新价')
+
+    # 添加全局变量
+    context.pos = 0  # position
+    context.trend = 0  # bar趋势信号,1--上涨,-1--下跌
+    context.trade_list = []  # 记录成交订单列表
+    context.count_order = 0  # 记录发单次数
+    context.count_trade = 0  # 记录成交次数
+    context.ordertype_value = 1 #记录订单撤销成功与否
+    
+    context.quote_bid_1 = None
+    context.quote_ofr_1 = None
+    context.his_tick=[]
+ 
+def on_tick(context, tick):
+    """逐笔成交或盘口触发"""
+    cancel_all_orders()  # 如果订单未及时成交，撤销所有未成交单子
+
+    # 如果不允许发单，直接返回
+    if context.open_flag == 0:
+        return
+    #如果订单撤销失败
+    if context.ordertype_value == 0: 
+        return
+    # 如果没有形成趋势，直接返回
+    if context.trend == 0:
+        return
+    # 如果发单次数超限，直接返回
+    if context.count_order >= context.max_order:
+        return
+    # 如果成交次数到上线，直接返回
+    if context.count_trade >= context.max_trade:
+        return
+
+   
+    if tick.category == 'deal':
+        # 获取成交数据
+        context.his_tick = get_deal_n(cic_code=context.cs1.cic_code,count=5,fields=['price'])
+        context.his_tick = np.array(context.his_tick['price'])
+        context.price_last = context.his_tick[-1]
+    elif tick.category == 'quote':
+        # 获取档位行情数据
+        context.quote_bid_1 = tick.bid_price[0]
+        context.quote_ofr_1 = tick.offer_price[0]
+    else:
+        pass
+    
+    if context.his_tick is None or len(context.his_tick) < 5:
+        return
+    
+    # 获取仓位
+    position = get_position(security_id=context.cs1.symbol,strategy_group='A')
+    context.pos = position.hold_volume * position.side.value
+
+    # 分钟线上涨，最新成交上涨，买入做多或者平空
+    if context.trend == 1   and context.pos <= 0 and context.his_tick[-1]>context.his_tick[-2] and context.quote_bid_1 is not None:       
+        orderid_buy = send_order(platform_code=context.cs1.platform,
+                                 security_id=context.cs1.symbol,
+                                 volume=context.per_volume if context.pos == 0 else 0 - context.pos,
+                                 price=context.quote_bid_1,
+                                 order_type=OrderType.LIMIT,
+                                 side=OrderSide.BUY,
+                                 strategy_group='A')
+        context.count_order += 1
+    # 分钟线下跌，最新成交下跌，卖出做空或者平多
+    elif context.trend == -1  and context.pos >= 0 and context.his_tick[-1]<context.his_tick[-2] and context.quote_ofr_1 is not None:
+        orderid_sell = send_order(platform_code=context.cs1.platform,
+                                  security_id=context.cs1.symbol,
+                                  volume=context.per_volume if context.pos == 0 else context.pos,
+                                  price=context.quote_ofr_1,
+                                  order_type=OrderType.LIMIT,
+                                  side=OrderSide.SELL,
+                                  strategy_group='A')
+        context.count_order += 1
+    else:
+        return
+
+    #止盈止损
+    if (context.pos != 0 and position.unrealized_pnl <= 0 - abs(position.hold_volume) * context.stop_loss) or  (context.pos != 0 
+        and position.unrealized_pnl >= abs(position.hold_volume) * context.take_profit): #止损止盈比例
+        
+        if context.pos > 0 and context.quote_bid_1 is not None: #平多单，已买一价卖
+            orderid_sell = send_order(platform_code=context.cs1.platform,
+                                  security_id=context.cs1.symbol,
+                                  volume=context.per_volume if context.pos == 0 else context.pos,
+                                  price=context.quote_bid_1,
+                                  order_type=OrderType.LIMIT,
+                                  side=OrderSide.SELL,
+                                  strategy_group='A')
+            context.count_order += 1
+        elif context.pos < 0 and context.quote_ofr_1 is not None: #平空单，已卖一价买
+            orderid_buy = send_order(platform_code=context.cs1.platform,
+                                 security_id=context.cs1.symbol,
+                                 volume=context.per_volume if context.pos == 0 else 0 - context.pos,
+                                 price=context.quote_ofr_1,
+                                 order_type=OrderType.LIMIT,
+                                 side=OrderSide.BUY,
+                                 strategy_group='A')
+            context.count_order += 1
+        else:
+            pass
+
+    
+
+def on_bar(context, bar):
+    """ Bar 触发"""
+
+    # 获取计算指标所需数据
+    need_data = get_bar_n(cic_code=context.cs2.cic_code,
+                          interval=context.cs2.interval,
+                          count=context.slow_period + 5,
+                          fields=['close'])
+    need_close = np.array(need_data['close'])
+
+    # 获取到所需数据才进行指标计算和发单操作
+    if (len(need_close) == context.slow_period + 5):
+        on_bar_fast = talib.SMA(need_close, timeperiod=context.fast_period)
+        on_bar_slow = talib.SMA(need_close, timeperiod=context.slow_period)
+
+        if (not pd.isna(on_bar_fast[-1])):
+            # 保存因子值
+            context.Fast = on_bar_fast[-1]
+            context.Slow = on_bar_slow[-1]
+
+            # 均线下穿，做空
+            if (on_bar_slow[-2] <= on_bar_fast[-2]) and (on_bar_slow[-1] > on_bar_fast[-1]):
+                context.trend = -1
+                print(-1)
+
+            # 均线上穿，做多
+            elif (on_bar_fast[-2] <= on_bar_slow[-2]) and (on_bar_fast[-1] > on_bar_slow[-1]):
+                context.trend = 1
+                print(1)
+
+            else:
+                print(0)
+                context.trend = 0
+
+def on_order(context, order):
+    """订单变化触发"""
+    context.ordertype_value = 1 
+    # 假如订单状态是全部成交或部分成交，计入成交列表中并统计成交次数
+    if order.order_status.value == 2 or order.order_status.value == 12:
+        context.count_trade += 1
+        if order.order_id not in context.trade_list:  # 防止重复记录
+            context.trade_list.append(order.order_id)  # 更新limit成交列表       
+    #判断订单撤销是否失败
+    elif order.order_status.value == 3 or  order.order_status.value == 4: #如果订单撤销失败
+        context.ordertype_value = 0
