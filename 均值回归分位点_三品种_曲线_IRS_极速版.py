@@ -1,0 +1,391 @@
+import numpy as np
+import pandas as pd
+from ComstarApi import *
+
+
+def init(context):
+    """
+    行情设置格式（行情码和BAR级别仅供参考，可根据需要进行修改）
+
+    行情码            类型       频率    下单平台          是否撮合    数据清洗    全域变量
+    FR007_10Y.CFX    K-Bar      1min    X-Swap实时承接    是         原始         cs1
+    FR007_5Y.CFX     K-Bar      1min    X-Swap实时承接    是         原始         cs2
+    FR007_1Y.CFX     K-Bar      1min    X-Swap实时承接    是         原始         cs3
+    YCCDB10Y.CFXM    逐笔成交    0       CFETS            否         原始         cs4
+    YCCDB5Y.CFXM     逐笔成交    0       CFETS            否         原始         cs5
+    YCCDB1Y.CFXM     逐笔成交    0       CFETS            否         原始         cs6
+
+    策略逻辑
+
+    计算IRS三个不同品种对应曲线过去N个值的价差（短期限 + 长期限 - 2 * 中期限）及价差的75%分位点、50%分位点和25%分位点。
+    当IRS BAR的价差突破75%分位点时卖出价差，卖出价差后当IRS BAR的价差跌破50%分位点时平仓买入价差；
+    当IRS BAR的价差跌破25%分位点时买入价差，买入价差后当IRS BAR的价差突破50%分位点时平仓卖出价差。
+    """
+
+    # 接收参数
+    context.quantile_period = add_parameter(int, 'quantile_period', '分位点计算周期')
+    context.cs1_trade_volume = add_parameter(int, 'cs1_trade_volume', 'CS1下单量')
+    context.cs2_trade_volume = add_parameter(int, 'cs2_trade_volume', 'CS2下单量')
+    context.cs3_trade_volume = add_parameter(int, 'cs3_trade_volume', 'CS3下单量')
+
+    # 添加因子
+    context.bar_spread = add_factor(float, 'bar_spread', 'BAR价差')
+    context.curve_spread = add_factor(float, 'curve_spread', '曲线价差')
+    context.percent_75 = add_factor(float, 'percent_75', '75%分位点')
+    context.percent_50 = add_factor(float, 'percent_50', '50%分位点')
+    context.percent_25 = add_factor(float, 'percent_25', '25%分位点')
+
+    # 添加全局变量
+    context.strategy_group = 'A'
+    context.cs1_close = None
+    context.cs2_close = None
+    context.cs3_close = None
+    context.flag_75 = False
+    context.flag_25 = False
+
+
+def on_bar(context, bar):
+    # 如果接收到的是长期限品种的BAR数据，记录BAR的收盘价
+    if bar.cic_code == context.cs1.cic_code:
+        context.cs1_close = bar.close
+
+    # 如果接收到的是中期限品种的BAR数据，记录BAR的收盘价
+    if bar.cic_code == context.cs2.cic_code:
+        context.cs2_close = bar.close
+
+    # 如果接收到的是短期限品种的BAR数据，记录BAR的收盘价
+    if bar.cic_code == context.cs3.cic_code:
+        context.cs3_close = bar.close
+
+    # 获取短期限品种与中期限品种收盘价的价差数据
+    # short_middle_bar_spread_data = get_diff_history_n(first_cic_code=context.cs3.cic_code,
+    #                                                   first_category='deal',
+    #                                                   first_interval=context.cs3.interval,
+    #                                                   first_field='close',
+    #                                                   second_cic_code=context.cs2.cic_code,
+    #                                                   second_category='deal',
+    #                                                   second_interval=context.cs2.interval,
+    #                                                   second_field='close',
+    #                                                   count=2)
+
+    # # 对获取到的数据进行填充操作
+    # short_middle_bar_spread_data = format_data(short_middle_bar_spread_data['close-close'], method='fill')
+
+    bar_data_3 = get_bar_n(cic_code=context.cs3.cic_code,
+                                interval=context.cs3.interval,
+                                count=context.quantile_period,
+                                fields=['close_yield'])
+    bar_data_2 = get_bar_n(cic_code=context.cs2.cic_code,
+                            interval=context.cs2.interval,
+                            count=context.quantile_period,
+                            fields=['close_yield'])
+    bar_data_3 = pd.Series(bar_data_3['close_yield'])
+    bar_data_3.fillna(method='ffill',inplace=True)
+    bar_data_3 = np.array(bar_data_3)
+    bar_data_2 = pd.Series(bar_data_2['close_yield'])
+    bar_data_2.fillna(method='ffill',inplace=True)
+    bar_data_2 = np.array(bar_data_2)
+    short_middle_bar_spread_data = bar_data_3 - bar_data_2
+
+    # 获取长期限品种与中期限品种收盘价的价差数据
+    # long_middle_bar_spread_data = get_diff_history_n(first_cic_code=context.cs1.cic_code,
+    #                                                  first_category='deal',
+    #                                                  first_interval=context.cs1.interval,
+    #                                                  first_field='close',
+    #                                                  second_cic_code=context.cs2.cic_code,
+    #                                                  second_category='deal',
+    #                                                  second_interval=context.cs2.interval,
+    #                                                  second_field='close',
+    #                                                  count=2)
+
+    # # 对获取到的数据进行填充操作
+    # long_middle_bar_spread_data = format_data(long_middle_bar_spread_data['close-close'], method='fill')
+
+    bar_data_1 = get_bar_n(cic_code=context.cs1.cic_code,
+                                interval=context.cs1.interval,
+                                count=context.quantile_period,
+                                fields=['close_yield'])
+    bar_data_2 = get_bar_n(cic_code=context.cs2.cic_code,
+                            interval=context.cs2.interval,
+                            count=context.quantile_period,
+                            fields=['close_yield'])
+    bar_data_1 = pd.Series(bar_data_1['close_yield'])
+    bar_data_1.fillna(method='ffill',inplace=True)
+    bar_data_1 = np.array(bar_data_1)
+    bar_data_2 = pd.Series(bar_data_2['close_yield'])
+    bar_data_2.fillna(method='ffill',inplace=True)
+    bar_data_2 = np.array(bar_data_2)
+    long_middle_bar_spread_data = bar_data_1 - bar_data_2
+
+    # 如果填充后的价差数据的数据量不为0条且最后一条不为NaN值，则进行因子赋值
+    if (len(short_middle_bar_spread_data) >= 1) and (len(long_middle_bar_spread_data) >= 1) and (
+            not np.isnan(short_middle_bar_spread_data[-1])) and (not np.isnan(long_middle_bar_spread_data[-1])):
+        # 因子赋值
+        context.bar_spread = short_middle_bar_spread_data[-1] + long_middle_bar_spread_data[-1]
+
+    # 如果填充后的价差数据的数据量完整且不含NaN值，则进行后续操作
+    if (len(short_middle_bar_spread_data) == len(long_middle_bar_spread_data) == 2) and (
+            sum(np.isnan(short_middle_bar_spread_data)) == 0) and (sum(np.isnan(long_middle_bar_spread_data)) == 0):
+        # 计算三品种收盘价的价差数据（短期限 + 长期限 - 2 * 中期限）
+        bar_spread_data = short_middle_bar_spread_data + long_middle_bar_spread_data
+
+        # 获取长期限曲线的last_yield数据
+        cs4_curve_data = get_market_data_n(cic_code=context.cs4.cic_code,
+                                           count=context.quantile_period,
+                                           fields=['last_yield'])
+
+        # 对获取到的数据进行填充操作
+        cs4_curve_data = format_data(cs4_curve_data['last_yield'], method='fill')
+
+        # 获取中期限曲线的last_yield数据
+        cs5_curve_data = get_market_data_n(cic_code=context.cs5.cic_code,
+                                           count=context.quantile_period,
+                                           fields=['last_yield'])
+
+        # 对获取到的数据进行填充操作
+        cs5_curve_data = format_data(cs5_curve_data['last_yield'], method='fill')
+
+        # 获取短期限曲线的last_yield数据
+        cs6_curve_data = get_market_data_n(cic_code=context.cs6.cic_code,
+                                           count=context.quantile_period,
+                                           fields=['last_yield'])
+
+        # 对获取到的数据进行填充操作
+        cs6_curve_data = format_data(cs6_curve_data['last_yield'], method='fill')
+
+        # 如果获取到曲线数据的数据量完整且不含NaN值，则进行后续操作
+        if (len(cs4_curve_data) == len(cs5_curve_data) == len(cs6_curve_data) == context.quantile_period) and (
+                sum(np.isnan(cs4_curve_data)) == 0) and (sum(np.isnan(cs5_curve_data)) == 0) and (
+                sum(np.isnan(cs6_curve_data)) == 0):
+            # 计算曲线的价差数据（短期限 + 长期限 - 2 * 中期限）
+            curve_spread_data = cs4_curve_data + cs6_curve_data - (2 * cs5_curve_data)
+
+            # 计算曲线的价差数据的最大值和最小值
+            max_curve_spread = max(curve_spread_data)
+            min_curve_spread = min(curve_spread_data)
+
+            # 计算曲线的价差数据的75%、50%、25%分位点并赋值给全局变量
+            cur_percent_75 = min_curve_spread + (max_curve_spread - min_curve_spread) * 0.75
+            cur_percent_50 = min_curve_spread + (max_curve_spread - min_curve_spread) * 0.50
+            cur_percent_25 = min_curve_spread + (max_curve_spread - min_curve_spread) * 0.25
+
+            # 因子赋值
+            context.curve_spread = curve_spread_data[-1]
+            context.percent_75 = cur_percent_75
+            context.percent_50 = cur_percent_50
+            context.percent_25 = cur_percent_25
+
+            # 如果保存的三品种BAR的收盘价有值，则进行后续操作
+            if (context.cs1_close is not None) and (context.cs2_close is not None) and (context.cs3_close is not None):
+
+                # IRS BAR的价差突破曲线价差的75%分位值时，如未在75%分位开仓，则开仓卖出价差
+                if (not context.flag_75) and (bar_spread_data[-2] < cur_percent_75 < bar_spread_data[-1]):
+                    # 卖出价差即卖出长期限和短期限品种，买入中期限品种
+                    cs1_side = cs3_side = OrderSide.SELL
+                    cs2_side = OrderSide.BUY
+
+                    # 发出订单（卖出长期限品种），发单价格为保存的长期限品种BAR的收盘价
+                    cs1_order_id = send_order(platform_code=context.cs1.platform,
+                                              security_id=context.cs1.symbol,
+                                              volume=context.cs1_trade_volume,
+                                              price=context.cs1_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs1_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs1_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs1.cic_code, cs1_side, context.cs1_close, context.cs1_trade_volume))
+
+                    # 发出订单（买入中期限品种），发单价格为保存的中期限品种BAR的收盘价
+                    cs2_order_id = send_order(platform_code=context.cs2.platform,
+                                              security_id=context.cs2.symbol,
+                                              volume=context.cs2_trade_volume,
+                                              price=context.cs2_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs2_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs2_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs2.cic_code, cs2_side, context.cs2_close, context.cs2_trade_volume))
+
+                    # 发出订单（卖出短期限品种），发单价格为保存的短期限品种BAR的收盘价
+                    cs3_order_id = send_order(platform_code=context.cs3.platform,
+                                              security_id=context.cs3.symbol,
+                                              volume=context.cs3_trade_volume,
+                                              price=context.cs3_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs3_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs3_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs3.cic_code, cs3_side, context.cs3_close, context.cs3_trade_volume))
+
+                    # 在75%分位卖出价差后，将75%分位的开仓标志置为True
+                    context.flag_75 = True
+
+                # 如已在75%分位开仓，且IRS BAR的价差跌破曲线价差的50%分位值时，则平仓买入价差
+                if context.flag_75 and (bar_spread_data[-2] > cur_percent_50 > bar_spread_data[-1]):
+                    # 买入价差即买入长期限和短期限品种，卖出中期限品种
+                    cs1_side = cs3_side = OrderSide.BUY
+                    cs2_side = OrderSide.SELL
+
+                    # 发出订单（买入长期限品种），发单价格为保存的长期限品种BAR的收盘价
+                    cs1_order_id = send_order(platform_code=context.cs1.platform,
+                                              security_id=context.cs1.symbol,
+                                              volume=context.cs1_trade_volume,
+                                              price=context.cs1_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs1_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs1_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs1.cic_code, cs1_side, context.cs1_close, context.cs1_trade_volume))
+
+                    # 发出订单（卖出中期限品种），发单价格为保存的中期限品种BAR的收盘价
+                    cs2_order_id = send_order(platform_code=context.cs2.platform,
+                                              security_id=context.cs2.symbol,
+                                              volume=context.cs2_trade_volume,
+                                              price=context.cs2_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs2_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs2_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs2.cic_code, cs2_side, context.cs2_close, context.cs2_trade_volume))
+
+                    # 发出订单（买入短期限品种），发单价格为保存的短期限品种BAR的收盘价
+                    cs3_order_id = send_order(platform_code=context.cs3.platform,
+                                              security_id=context.cs3.symbol,
+                                              volume=context.cs3_trade_volume,
+                                              price=context.cs3_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs3_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs3_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs3.cic_code, cs3_side, context.cs3_close, context.cs3_trade_volume))
+
+                    # 75%分位的开仓已在50%分位平仓，将75%分位的开仓标志置为False
+                    context.flag_75 = False
+
+                # IRS BAR的价差跌破曲线价差的25%分位值时，如未在25%分位开仓，则开仓买入价差
+                if (not context.flag_25) and (bar_spread_data[-2] > cur_percent_25 > bar_spread_data[-1]):
+                    # 买入价差即买入长期限和短期限品种，卖出中期限品种
+                    cs1_side = cs3_side = OrderSide.BUY
+                    cs2_side = OrderSide.SELL
+
+                    # 发出订单（买入长期限品种），发单价格为保存的长期限品种BAR的收盘价
+                    cs1_order_id = send_order(platform_code=context.cs1.platform,
+                                              security_id=context.cs1.symbol,
+                                              volume=context.cs1_trade_volume,
+                                              price=context.cs1_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs1_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs1_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs1.cic_code, cs1_side, context.cs1_close, context.cs1_trade_volume))
+
+                    # 发出订单（卖出中期限品种），发单价格为保存的中期限品种BAR的收盘价
+                    cs2_order_id = send_order(platform_code=context.cs2.platform,
+                                              security_id=context.cs2.symbol,
+                                              volume=context.cs2_trade_volume,
+                                              price=context.cs2_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs2_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs2_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs2.cic_code, cs2_side, context.cs2_close, context.cs2_trade_volume))
+
+                    # 发出订单（买入短期限品种），发单价格为保存的短期限品种BAR的收盘价
+                    cs3_order_id = send_order(platform_code=context.cs3.platform,
+                                              security_id=context.cs3.symbol,
+                                              volume=context.cs3_trade_volume,
+                                              price=context.cs3_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs3_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs3_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs3.cic_code, cs3_side, context.cs3_close, context.cs3_trade_volume))
+
+                    # 在25%分位买入价差后，将25%分位的开仓标志置为True
+                    context.flag_25 = True
+
+                # 如已在25%分位开仓，且IRS BAR的价差突破曲线价差的50%分位值时，则平仓卖出价差
+                if context.flag_25 and (bar_spread_data[-2] < cur_percent_50 < bar_spread_data[-1]):
+                    # 卖出价差即卖出长期限和短期限品种，买入中期限品种
+                    cs1_side = cs3_side = OrderSide.SELL
+                    cs2_side = OrderSide.BUY
+
+                    # 发出订单（卖出长期限品种），发单价格为保存的长期限品种BAR的收盘价
+                    cs1_order_id = send_order(platform_code=context.cs1.platform,
+                                              security_id=context.cs1.symbol,
+                                              volume=context.cs1_trade_volume,
+                                              price=context.cs1_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs1_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs1_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs1.cic_code, cs1_side, context.cs1_close, context.cs1_trade_volume))
+
+                    # 发出订单（买入中期限品种），发单价格为保存的中期限品种BAR的收盘价
+                    cs2_order_id = send_order(platform_code=context.cs2.platform,
+                                              security_id=context.cs2.symbol,
+                                              volume=context.cs2_trade_volume,
+                                              price=context.cs2_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs2_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs2_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs2.cic_code, cs2_side, context.cs2_close, context.cs2_trade_volume))
+
+                    # 发出订单（卖出短期限品种），发单价格为保存的短期限品种BAR的收盘价
+                    cs3_order_id = send_order(platform_code=context.cs3.platform,
+                                              security_id=context.cs3.symbol,
+                                              volume=context.cs3_trade_volume,
+                                              price=context.cs3_close,
+                                              order_type=OrderType.LIMIT,
+                                              side=cs3_side,
+                                              strategy_group=context.strategy_group)
+
+                    # 如果发单成功，打印相应信息
+                    if cs3_order_id != 0:
+                        print('{0}发单成功，发单方向为：{1}，发单价格为：{2}，发单量为：{3}'.format(
+                            context.cs3.cic_code, cs3_side, context.cs3_close, context.cs3_trade_volume))
+
+                    # 25%分位的开仓已在50%分位平仓，将25%分位的开仓标志置为False
+                    context.flag_25 = False
+
+
+def on_tick(context, tick):
+    pass
+
+
+def on_order(context, order):
+    pass
